@@ -1,90 +1,139 @@
-name: HarmonyOS
-
-# Build check for the HarmonyOS client. Produces an unsigned debug HAP; it
-# verifies that harmony/ compiles but is not a distributable artifact.
+name: HarmonyOS HAP
 
 on:
-  push:
-    branches:
-      - main
-      - v2
-    paths:
-      - harmony/**
-      - .github/workflows/harmony.yml
-  pull_request:
-    paths:
-      - harmony/**
-      - .github/workflows/harmony.yml
   workflow_dispatch:
+  push:
+    branches: [chore/hmo/hap-ci]
+    paths:
+      - 'harmony/**'
+      - '.github/workflows/harmony.yml'
+
+permissions:
+  contents: read
 
 concurrency:
   group: harmony-hap-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
-defaults:
-  run:
-    shell: bash
-    working-directory: harmony
-
 jobs:
   build:
-    name: HarmonyOS headless build
+    name: Build unsigned HarmonyOS packages
     runs-on: ubuntu-latest
-    # Third-party image with the HarmonyOS SDK / ohpm / hvigorw. workflow_dispatch
-    # ignores `paths`, so it can be used to validate the image; pin it to a digest
-    # after the first successful run.
-    container: ghcr.io/dalongzhuazi/harmonyos-ci:api26r
+    timeout-minutes: 30
+    env:
+      HARMONY_CLI_TOOLS_VERSION: '26.0.0.821'
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Cache hvigor distribution
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      # Same SDK and setup action as libo0118/codex-mobile-bridge.
+      - name: Verify SDK mirror release reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          actual=$(gh api repos/ErBWs/ohos-sdk/git/ref/tags/26.0.0.821 --jq '.object.sha')
+          test "$actual" = '8b294a949bdf7191e1a7ffa878be748c9032983b'
+      - name: Set up HarmonyOS CLI tools
+        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721
         with:
-          path: /root/.hvigor
-          key: hvigor-${{ runner.os }}-${{ hashFiles('harmony/hvigor/hvigor-config.json5') }}
-          restore-keys: |
-            hvigor-${{ runner.os }}-
-
-      - name: Install dependencies
+          version: '26.0.0.821'
+          cache: 'true'
+      - name: Inspect toolchain and prepare unsigned configuration
+        working-directory: harmony
+        run: |
+          node --version
+          ohpm --version
+          hvigorw --version
+          cat "$HOS_SDK_HOME/default/sdk-pkg.json"
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('build-profile.json5')
+          text = path.read_text()
+          reference = '"signingConfig": "default",'
+          if text.count(reference) != 1:
+              raise RuntimeError('Expected the upstream unsigned signing reference exactly once')
+          path.write_text(text.replace(reference, ''))
+          PY
+      - name: Install HarmonyOS dependencies
+        working-directory: harmony
         run: ohpm install --all
-
-      - name: Build HAP
+      - name: Build HAP and shared modules
+        working-directory: harmony
         run: |
-          hvigorw clean --no-daemon
-          hvigorw assembleHap --mode module -p product=default -p buildMode=debug --no-daemon --stacktrace
-
-      - name: Collect and verify artifacts
+          hvigorw --mode project -p product=default -p buildMode=release assembleApp --no-daemon --stacktrace
+      - name: Verify and collect packages
         run: |
-          set -eu
-          mkdir -p dist
-          find . -type f -name '*.hap' -path '*/outputs/*' \
-            -not -path './oh_modules/*' -not -path './node_modules/*' \
-            -exec cp -v {} dist/ \;
-          shopt -s nullglob
-          haps=(dist/*.hap)
-          if [ ${#haps[@]} -eq 0 ]; then
-            echo "::error::No .hap produced, check the build log above"
-            exit 1
-          fi
-          for h in "${haps[@]}"; do
-            size=$(stat -c%s "$h")
-            if [ "$size" -le 0 ]; then
-              echo "::error::$h is empty"
-              exit 1
-            fi
-            echo "$h: $size bytes"
-          done
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import shutil
+          import zipfile
+          from pathlib import Path
 
-      - name: Upload artifacts
+          root = Path('harmony')
+          output = Path('dist/harmony')
+          output.mkdir(parents=True, exist_ok=True)
+          packages = []
+          for module, extension in [('entry', '.hap'), ('session', '.hsp'), ('terminal', '.hsp'), ('files', '.hsp')]:
+              candidates = list((root / module / 'build/default/outputs/default').glob('*' + extension))
+              if len(candidates) != 1:
+                  raise RuntimeError(f'{module}: expected one {extension}, found {candidates}')
+              source = candidates[0]
+              with zipfile.ZipFile(source) as archive:
+                  bad = archive.testzip()
+                  if bad:
+                      raise RuntimeError(f'{source}: corrupt member {bad}')
+                  for member in ['module.json', 'ets/modules.abc', 'resources.index']:
+                      if archive.getinfo(member).file_size == 0:
+                          raise RuntimeError(f'{source}: empty {member}')
+                  manifest = json.loads(archive.read('module.json'))
+                  if manifest['app']['bundleName'] != 'com.agentsanywhere.app':
+                      raise RuntimeError(f'{source}: unexpected bundle name')
+                  if manifest['module']['name'] != module:
+                      raise RuntimeError(f'{source}: unexpected module name')
+              destination = output / source.name
+              shutil.copyfile(source, destination)
+              packages.append({'name': destination.name, 'bytes': destination.stat().st_size,
+                               'sha256': hashlib.sha256(destination.read_bytes()).hexdigest()})
+          apps = list((root / 'build/outputs').rglob('*.app'))
+          if len(apps) != 1:
+              raise RuntimeError(f'Expected one complete APP bundle, found {apps}')
+          with zipfile.ZipFile(apps[0]) as archive:
+              if archive.testzip():
+                  raise RuntimeError('Corrupt APP bundle')
+              bundled = {Path(name).name for name in archive.namelist()}
+              missing = {p['name'] for p in packages} - bundled
+              if missing:
+                  raise RuntimeError(f'APP is missing modules: {missing}')
+          destination = output / 'Agents-Anywhere-HarmonyOS-unsigned.app'
+          shutil.copyfile(apps[0], destination)
+          packages.append({'name': destination.name, 'bytes': destination.stat().st_size,
+                           'sha256': hashlib.sha256(destination.read_bytes()).hexdigest()})
+          (output / 'SHA256SUMS.txt').write_text(''.join(f"{p['sha256']}  {p['name']}\n" for p in packages))
+          sdk = json.loads((Path(os.environ['HOS_SDK_HOME']) / 'default/sdk-pkg.json').read_text())
+          info = {'repository': os.environ['GITHUB_REPOSITORY'], 'commit': os.environ['GITHUB_SHA'],
+                  'run': os.environ['GITHUB_RUN_ID'], 'signed': False,
+                  'cliToolsVersion': os.environ['HARMONY_CLI_TOOLS_VERSION'], 'sdk': sdk, 'packages': packages}
+          (output / 'build-info.json').write_text(json.dumps(info, ensure_ascii=False, indent=2) + '\n')
+          (output / 'INSTALL.txt').write_text(
+              'Agents Anywhere / com.agentsanywhere.app\n'
+              'Unsigned build: sign with your own HarmonyOS developer certificate and device profile before installation.\n'
+              'The entry HAP requires session, terminal and files HSPs. Sign all four modules with the same identity.\n'
+              'The APP archive contains all four modules. Do not install the entry HAP alone.\n'
+              'After signing: hdc install entry-signed.hap session-signed.hsp terminal-signed.hsp files-signed.hsp\n'
+              'Compilation and archive checks do not replace real-device testing.\n')
+          print(json.dumps(info, ensure_ascii=False, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('### HarmonyOS unsigned build\n\nDownload **Agents-Anywhere-HarmonyOS-unsigned** below.\n\n')
+              summary.write('Includes the entry HAP, three required HSPs, a complete APP archive, SHA-256 checksums and build metadata.\n\n')
+              summary.write('Device installation requires signing all modules for your device. No real-device test was performed.\n\n')
+              summary.write('| File | Bytes |\n| --- | ---: |\n')
+              for package in packages:
+                  summary.write(f"| {package['name']} | {package['bytes']} |\n")
+          PY
+      - name: Upload HAP and required shared modules
         uses: actions/upload-artifact@v4
         with:
-          name: hap-unsigned
-          # `working-directory` does not apply to `uses:` steps; resolve from
-          # the repository root.
-          path: harmony/dist/
+          name: Agents-Anywhere-HarmonyOS-unsigned
+          path: dist/harmony/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
