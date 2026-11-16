@@ -63,6 +63,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import hashlib
+          import io
           import json
           import os
           import shutil
@@ -100,10 +101,17 @@ jobs:
           with zipfile.ZipFile(apps[0]) as archive:
               if archive.testzip():
                   raise RuntimeError('Corrupt APP bundle')
-              bundled = {Path(name).name for name in archive.namelist()}
-              missing = {p['name'] for p in packages} - bundled
-              if missing:
-                  raise RuntimeError(f'APP is missing modules: {missing}')
+              bundled = set()
+              for name in archive.namelist():
+                  if Path(name).suffix not in ('.hap', '.hsp'):
+                      continue
+                  with zipfile.ZipFile(io.BytesIO(archive.read(name))) as module_archive:
+                      manifest = json.loads(module_archive.read('module.json'))
+                      if manifest['app']['bundleName'] != 'com.agentsanywhere.app':
+                          raise RuntimeError(f'APP contains unexpected bundle: {name}')
+                      bundled.add(manifest['module']['name'])
+              if bundled != {'entry', 'session', 'terminal', 'files'}:
+                  raise RuntimeError(f'APP has unexpected module set: {bundled}')
           destination = output / 'Agents-Anywhere-HarmonyOS-unsigned.app'
           shutil.copyfile(apps[0], destination)
           packages.append({'name': destination.name, 'bytes': destination.stat().st_size,
